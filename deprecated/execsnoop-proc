@@ -1,150 +1,152 @@
-#!/usr/bin/perl
+#!/usr/bin/env python3
 #
 # execsnoop - trace process exec() with arguments. /proc version.
 #             Written using Linux ftrace.
 #
-# This shows the execution of new processes, especially short-lived ones that
-# can be missed by sampling tools such as top(1).
-#
-# USAGE: ./execsnoop [-h] [-n name]
-#
-# REQUIREMENTS: FTRACE CONFIG, sched:sched_process_exec tracepoint (you may
-# already have these on recent kernels), and Perl.
-#
-# This traces exec() from the fork()->exec() sequence, which means it won't
-# catch new processes that only fork(), and, it will catch processes that
-# re-exec. This instruments sched:sched_process_exec without buffering, and then
-# in user-space (this program) reads PPID and process arguments asynchronously
-# from /proc.
-#
-# If the process traced is very short-lived, this program may miss reading
-# arguments and PPID details. In that case, "<?>" and "?" will be printed
-# respectively. This program is best-effort, and should be improved in the
-# future when other kernel capabilities are made available. If you need a
-# more reliable tool now, then consider other tracing alternatives (eg,
-# SystemTap). This tool is really a proof of concept to see what ftrace can
-# currently do.
+# This is a Python port of the original Perl implementation. It intentionally
+# preserves the ftrace setup, /proc races, output format, and command-line API.
 #
 # From perf-tools: https://github.com/brendangregg/perf-tools
-#
-# See the execsnoop(8) man page (in perf-tools) for more info.
-#
 # COPYRIGHT: Copyright (c) 2014 Brendan Gregg.
-#
-#  This program is free software; you can redistribute it and/or
-#  modify it under the terms of the GNU General Public License
-#  as published by the Free Software Foundation; either version 2
-#  of the License, or (at your option) any later version.
-#
-#  This program is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU General Public License for more details.
-#
-#  You should have received a copy of the GNU General Public License
-#  along with this program; if not, write to the Free Software Foundation,
-#  Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
-#
-#  (http://www.gnu.org/copyleft/gpl.html)
-#
-# 07-Jul-2014	Brendan Gregg	Created this.
+# Licensed under the GNU General Public License, version 2 or later.
 
-use strict;
-use warnings;
-use POSIX qw(strftime);
-use Getopt::Long;
-my $tracing = "/sys/kernel/debug/tracing";
-my $flock = "/var/tmp/.ftrace-lock";
-my $tpdir = "sched/sched_process_exec";
-my $tptext = $tpdir; $tptext =~ s/\//:/;
-local $SIG{INT} = \&cleanup;
-local $SIG{QUIT} = \&cleanup;
-local $SIG{TERM} = \&cleanup;
-local $SIG{PIPE} = \&cleanup;
-local $SIG{HUP} = \&cleanup;
-$| = 1;
+import getopt
+import os
+import signal
+import sys
+import time
 
-### options
-my ($name, $help);
-GetOptions("name=s" => \$name,
-           "help"   => \$help)
-or usage();
-usage() if $help;
-sub usage {
-	print STDERR "USAGE: execsnoop [-h] [-n name]\n";
-	print STDERR "   eg,\n";
-	print STDERR "       execsnoop -n ls	# show \"ls\" cmds only.\n";
-	exit;
-}
 
-sub ldie {
-	unlink $flock;
-	die @_;
-}
+TRACING = "/sys/kernel/debug/tracing"
+FLOCK = "/var/tmp/.ftrace-lock"
+TPDIR = "sched/sched_process_exec"
+TPTEXT = TPDIR.replace("/", ":")
+trace_pipe = None
+cleaning_up = False
 
-sub writeto {
-	my ($string, $file) = @_;
-	open FILE, ">$file" or return 0;
-	print FILE $string or return 0;
-	close FILE or return 0;
-}
 
-### check permissions
-chdir "$tracing" or ldie "ERROR: accessing tracing. Root? Kernel has FTRACE?" .
-    "\ndebugfs mounted? (mount -t debugfs debugfs /sys/kernel/debug)";
+def usage():
+    print("USAGE: execsnoop [-h] [-n name]", file=sys.stderr)
+    print("   eg,", file=sys.stderr)
+    print('       execsnoop -n ls\t# show "ls" cmds only.', file=sys.stderr)
+    raise SystemExit(0)
 
-### ftrace lock
-if (-e $flock) {
-	open FLOCK, $flock; my $fpid = <FLOCK>; chomp $fpid; close FLOCK;
-	die "ERROR: ftrace may be in use by PID $fpid ($flock)";
-}
-writeto "$$", $flock or die "ERROR: unable to write $flock.";
 
-### setup and begin tracing
-writeto "nop", "current_tracer" or ldie "ERROR: disabling current_tracer.";
-writeto "1", "events/$tpdir/enable" or ldie "ERROR: enabling tracepoint " .
-    "\"$tptext\" (tracepoint missing in this kernel version?)";
-open TPIPE, "trace_pipe"  or warn "ERROR: opening trace_pipe.";
-printf "%-8s %6s %6s %s\n",  "TIME", "PID", "PPID", "ARGS";
+def writeto(string, path):
+    try:
+        with open(path, "w") as file:
+            file.write(string)
+        return True
+    except OSError:
+        return False
 
-while (<TPIPE>) {
-	my ($taskpid, $rest) = split;
-	my ($task, $pid) = $taskpid =~ /(.*)-(\d+)/;
 
-	next if (defined $name and $name ne $task);
+def die(message, remove_lock=False):
+    if remove_lock:
+        try:
+            os.unlink(FLOCK)
+        except OSError:
+            pass
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
 
-	my $args = "$task <?>";
-	if (open CMDLINE, "/proc/$pid/cmdline") {
-		my $arglist = <CMDLINE>;
-		if (defined $arglist) {
-			$arglist =~ s/\000/ /g;
-			$args = $arglist;
-		}
-		close CMDLINE;
-	}
 
-	my $ppid = "?";
-	if (open STAT, "/proc/$pid/stat") {
-		my $fields = <STAT>;
-		if (defined $fields) {
-			$ppid = (split ' ', $fields)[3];
-		}
-		close STAT;
-	}
+def cleanup(*_args):
+    global cleaning_up
+    if cleaning_up:
+        raise SystemExit(0)
+    cleaning_up = True
+    print("\nEnding tracing...")
+    if trace_pipe is not None:
+        trace_pipe.close()
+    if not writeto("0", f"events/{TPDIR}/enable"):
+        die(f'ERROR: disabling "{TPTEXT}"', remove_lock=True)
+    writeto("", "trace")
+    try:
+        os.unlink(FLOCK)
+    except OSError:
+        pass
+    raise SystemExit(0)
 
-	my $now = strftime "%H:%M:%S", localtime;
-	printf "%-8s %6s %6s %s\n", $now, $pid, $ppid, $args;
-}
 
-### end tracing
-cleanup();
+def main(argv):
+    global trace_pipe
+    name = None
+    try:
+        options, _arguments = getopt.getopt(argv, "hn:", ["help", "name="])
+    except getopt.GetoptError:
+        usage()
+    for option, value in options:
+        if option in ("-h", "--help"):
+            usage()
+        if option in ("-n", "--name"):
+            name = value
 
-sub cleanup {
-	print "\nEnding tracing...\n";
-	close TPIPE;
-	writeto "0", "events/$tpdir/enable" or
-	    ldie "ERROR: disabling \"$tptext\"";
-	writeto "", "trace";
-	unlink $flock;
-	exit;
-}
+    for signum in (signal.SIGINT, signal.SIGQUIT, signal.SIGTERM,
+                   signal.SIGPIPE, signal.SIGHUP):
+        signal.signal(signum, cleanup)
+
+    try:
+        os.chdir(TRACING)
+    except OSError:
+        die("ERROR: accessing tracing. Root? Kernel has FTRACE?\n"
+            "debugfs mounted? (mount -t debugfs debugfs /sys/kernel/debug)",
+            remove_lock=True)
+
+    if os.path.exists(FLOCK):
+        try:
+            with open(FLOCK) as file:
+                fpid = file.readline().rstrip("\n")
+        except OSError:
+            fpid = ""
+        die(f"ERROR: ftrace may be in use by PID {fpid} ({FLOCK})")
+    if not writeto(str(os.getpid()), FLOCK):
+        die(f"ERROR: unable to write {FLOCK}.")
+
+    if not writeto("nop", "current_tracer"):
+        die("ERROR: disabling current_tracer.", remove_lock=True)
+    if not writeto("1", f"events/{TPDIR}/enable"):
+        die(f'ERROR: enabling tracepoint "{TPTEXT}" '
+            "(tracepoint missing in this kernel version?)", remove_lock=True)
+    try:
+        trace_pipe = open("trace_pipe", errors="replace")
+    except OSError as error:
+        print(f"ERROR: opening trace_pipe: {error}", file=sys.stderr)
+        cleanup()
+
+    print(f"{'TIME':<8} {'PID':>6} {'PPID':>6} ARGS", flush=True)
+    for line in trace_pipe:
+        fields = line.split()
+        if not fields:
+            continue
+        match = __import__("re").match(r"(.*)-(\d+)$", fields[0])
+        if not match:
+            continue
+        task, pid = match.groups()
+        if name is not None and name != task:
+            continue
+
+        args = f"{task} <?>"
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as cmdline:
+                arglist = cmdline.readline()
+            if arglist:
+                args = arglist.replace(b"\0", b" ").decode(errors="replace")
+        except OSError:
+            pass
+
+        ppid = "?"
+        try:
+            with open(f"/proc/{pid}/stat") as stat:
+                stat_fields = stat.readline().split()
+            if len(stat_fields) > 3:
+                ppid = stat_fields[3]
+        except OSError:
+            pass
+        print(f"{time.strftime('%H:%M:%S'):<8} {pid:>6} {ppid:>6} {args}",
+              flush=True)
+    cleanup()
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

@@ -3,7 +3,7 @@
 tcpretrans \- show TCP retransmits, with address and other details. Uses Linux ftrace.
 .SH SYNOPSIS
 .B tcpretrans
-[\-hsp]
+[\-hls]
 .SH DESCRIPTION
 This traces TCP retransmits that are sent by the system tcpretrans is executed
 from, showing address, port, and TCP state information,
@@ -29,7 +29,7 @@ for %di).
 Since this uses ftrace, only the root user can use this tool.
 .SH REQUIREMENTS
 FTRACE and KPROBE CONFIG, tcp_retransmit_skb() kernel function.
-You may have these already have these on recent kernels. And Perl.
+You may already have these on recent kernels. Python 3 is also required.
 TCP tail loss probes were added in Linux 3.10.
 .SH OPTIONS
 .TP

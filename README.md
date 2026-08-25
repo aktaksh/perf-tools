@@ -5,6 +5,10 @@ A miscellaneous collection of in-development and unsupported performance analysi
 
 These tools are designed to be easy to install (fewest dependencies), provide advanced performance observability, and be simple to use: do one thing and do it well. This collection was created by Brendan Gregg (author of the DTraceToolkit).
 
+The `net/tcpretrans` and deprecated `execsnoop-proc` tools require Python 3.
+Their extensionless command names are preserved, so existing invocation
+examples continue to work unchanged.
+
 Many of these tools employ workarounds so that functionality is possible on existing Linux kernels. Because of this, many tools have caveats (see man pages), and their implementation should be considered a placeholder until future kernel features, or new tracing subsystems, are added.
 
 These are intended for Linux 3.2 and newer kernels. For Linux 2.6.x, see Warnings.

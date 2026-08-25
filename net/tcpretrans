@@ -1,311 +1,224 @@
-#!/usr/bin/perl
+#!/usr/bin/env python3
 #
-# tcpretrans - show TCP retransmts, with address and other details.
+# tcpretrans - show TCP retransmits, with address and other details.
 #              Written using Linux ftrace.
 #
-# This traces TCP retransmits, showing address, port, and TCP state information,
-# and sometimes the PID (although usually not, since retransmits are usually
-# sent by the kernel on timeouts). To keep overhead low, only
-# tcp_retransmit_skb() calls are traced (this does not trace every packet).
-#
-# USAGE: ./tcpretrans [-hls]
-#
-# REQUIREMENTS: FTRACE and KPROBE CONFIG, tcp_retransmit_skb() kernel function,
-# and tcp_send_loss_probe() when -l is used. You may have these already have
-# these on recent kernels. And Perl.
-#
-# This was written as a proof of concept for ftrace, for older Linux systems,
-# and without kernel debuginfo. It uses dynamic tracing of tcp_retransmit_skb(),
-# and reads /proc/net/tcp for socket details. Its use of dynamic tracing and
-# CPU registers is an unstable platform-specific workaround, and may require
-# modifications to work on different kernels and platforms. This would be better
-# written using a tracer such as SystemTap, and will likely be rewritten in the
-# future when certain tracing features are added to the Linux kernel.
-#
-# When -l is used, this also uses dynamic tracing of tcp_send_loss_probe() and
-# a register.
-#
-# Currently only IPv4 is supported, on x86_64. If you try this on a different
-# architecture, you'll likely need to adjust the register locations (search
-# for %di).
-#
-# OVERHEAD: The CPU overhead is relative to the rate of TCP retransmits, and is
-# designed to be low as this does not examine every packet. Once per second the
-# /proc/net/tcp file is read, and a buffer of retransmit trace events is
-# retrieved from the kernel and processed.
+# This is a Python port of the original Perl implementation. It intentionally
+# preserves its x86_64 kprobe ABI, one-second snapshots, IPv4-only lookup,
+# output format, and command-line API.
 #
 # From perf-tools: https://github.com/brendangregg/perf-tools
-#
-# See the tcpretrans(8) man page (in perf-tools) for more info.
-#
 # COPYRIGHT: Copyright (c) 2014 Brendan Gregg.
-#
-#  This program is free software; you can redistribute it and/or
-#  modify it under the terms of the GNU General Public License
-#  as published by the Free Software Foundation; either version 2
-#  of the License, or (at your option) any later version.
-#
-#  This program is distributed in the hope that it will be useful,
-#  but WITHOUT ANY WARRANTY; without even the implied warranty of
-#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#  GNU General Public License for more details.
-#
-#  You should have received a copy of the GNU General Public License
-#  along with this program; if not, write to the Free Software Foundation,
-#  Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
-#
-#  (http://www.gnu.org/copyleft/gpl.html)
-#
-# 28-Jul-2014	Brendan Gregg	Created this.
+# Licensed under the GNU General Public License, version 2 or later.
 
-use strict;
-use warnings;
-use POSIX qw(strftime);
-use Getopt::Long;
-my $tracing = "/sys/kernel/debug/tracing";
-my $flock = "/var/tmp/.ftrace-lock";
-my $interval = 1;
-local $SIG{INT} = \&cleanup;
-local $SIG{QUIT} = \&cleanup;
-local $SIG{TERM} = \&cleanup;
-local $SIG{PIPE} = \&cleanup;
-local $SIG{HUP} = \&cleanup;
-$| = 1;
+import getopt
+import os
+import re
+import signal
+import sys
+import time
 
-### options
-my ($help, $stacks, $tlp);
-GetOptions("help|h"   => \$help,
-	   "stacks|s" => \$stacks,
-	   "tlp|l" => \$tlp)
-or usage();
-usage() if $help;
 
-sub usage {
-	print STDERR "USAGE: tcpretrans [-hls]\n";
-	print STDERR "                  -h      # help message\n";
-	print STDERR "                  -l      # trace TCP tail loss probes\n";
-	print STDERR "                  -s      # print stack traces\n";
-	print STDERR "   eg,\n";
-	print STDERR "       tcpretrans         # trace TCP retransmits\n";
-	exit;
-}
+TRACING = "/sys/kernel/debug/tracing"
+FLOCK = "/var/tmp/.ftrace-lock"
+INTERVAL = 1
+KNAME_RTR = "tcpretrans_tcp_retransmit_skb"
+KNAME_TLP = "tcpretrans_tcp_send_loss_probe"
+TCP_STATES = ("NULL", "ESTABLISHED", "SYN_SENT", "SYN_RECV", "FIN_WAIT1",
+              "FIN_WAIT2", "TIME_WAIT", "CLOSE", "CLOSE_WAIT", "LAST_ACK",
+              "LISTEN", "CLOSING")
+stacks = False
+tlp = False
+cleaning_up = False
 
-# delete lock and die
-sub ldie {
-	unlink $flock;
-	die @_;
-}
 
-# end tracing (silently) and die
-sub edie {
-	print STDERR "@_\n";
-	close STDOUT;
-	close STDERR;
-	cleanup();
-}
+def usage():
+    print("USAGE: tcpretrans [-hls]", file=sys.stderr)
+    print("                  -h      # help message", file=sys.stderr)
+    print("                  -l      # trace TCP tail loss probes", file=sys.stderr)
+    print("                  -s      # print stack traces", file=sys.stderr)
+    print("   eg,", file=sys.stderr)
+    print("       tcpretrans         # trace TCP retransmits", file=sys.stderr)
+    raise SystemExit(0)
 
-sub writeto {
-	my ($string, $file) = @_;
-	open FILE, ">$file" or return 0;
-	print FILE $string or return 0;
-	close FILE or return 0;
-}
 
-sub appendto {
-	my ($string, $file) = @_;
-	open FILE, ">>$file" or return 0;
-	print FILE $string or return 0;
-	close FILE or return 0;
-}
+def writeto(string, path, append=False):
+    try:
+        with open(path, "a" if append else "w") as file:
+            file.write(string)
+        return True
+    except OSError:
+        return False
 
-# kprobe functions
-sub create_kprobe {
-	my ($kname, $kval) = @_;
-	appendto "p:$kname $kval", "kprobe_events" or return 0;
-}
 
-sub enable_kprobe {
-	my ($kname) = @_;
-	writeto "1", "events/kprobes/$kname/enable" or return 0;
-}
+def die(message, remove_lock=False):
+    if remove_lock:
+        try:
+            os.unlink(FLOCK)
+        except OSError:
+            pass
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
 
-sub remove_kprobe {
-	my ($kname) = @_;
-	writeto "0", "events/kprobes/$kname/enable" or return 0;
-	appendto "-:$kname", "kprobe_events" or return 0;
-}
 
-# tcp socket cache
-my %tcp;
-sub cache_tcp {
-	undef %tcp;
-	open(TCP, "/proc/net/tcp") or ldie "ERROR: reading /proc/net/tcp.";
-	while (<TCP>) {
-		next if /^ *sl/;
-		my ($sl, $local_address, $rem_address, $st, $tx_rx, $tr_tm,
-		    $retrnsmt, $uid, $timeout, $inode, $jf, $sk) = split;
-		$sk =~ s/^0x//;
-		$tcp{$sk}{laddr} = $local_address;
-		$tcp{$sk}{raddr} = $rem_address;
-		$tcp{$sk}{state} = $st;
-	}
-	close TCP;
-}
+def create_kprobe(name, value):
+    return writeto(f"p:{name} {value}", "kprobe_events", append=True)
 
-my @tcpstate;
-sub map_tcp_states {
-	push @tcpstate, "NULL";
-	for (<DATA>) {
-		chomp;
-		s/.*TCP_//;
-		s/[, ].*$//;
-		push @tcpstate, $_;
-	}
-}
 
-# /proc/net/tcp hex addr to dotted quad decimal
-sub inet_h2a {
-	my ($haddr) = @_;
+def enable_kprobe(name):
+    return writeto("1", f"events/kprobes/{name}/enable")
 
-	my @addr = ();
-	for my $num ($haddr =~ /(..)(..)(..)(..)/) {
-		unshift @addr, hex($num);
-	}
-	return join(".", @addr);
-}
 
-### check permissions
-chdir "$tracing" or die "ERROR: accessing tracing. Root? Kernel has FTRACE?" .
-    "\ndebugfs mounted? (mount -t debugfs debugfs /sys/kernel/debug)";
+def remove_kprobe(name):
+    return (writeto("0", f"events/kprobes/{name}/enable") and
+            writeto(f"-:{name}", "kprobe_events", append=True))
 
-### ftrace lock
-if (-e $flock) {
-	open FLOCK, $flock; my $fpid = <FLOCK>; chomp $fpid; close FLOCK;
-	die "ERROR: ftrace may be in use by PID $fpid ($flock)";
-}
-writeto "$$", $flock or die "ERROR: unable to write $flock.";
 
-#
-# Setup and begin tracing.
-# Use of ldie() and edie() ensures that if an error is encountered, the
-# kernel is not left in a partially configured state.
-#
-writeto "nop", "current_tracer" or ldie "ERROR: disabling current_tracer.";
-my $kname_rtr = "tcpretrans_tcp_retransmit_skb";
-my $kname_tlp = "tcpretrans_tcp_send_loss_probe";
-create_kprobe $kname_rtr, "tcp_retransmit_skb sk=%di" or
-    ldie "ERROR: creating kprobe for tcp_retransmit_skb().";;
-if ($tlp) {
-	create_kprobe $kname_tlp, "tcp_send_loss_probe sk=%di" or
-	    edie "ERROR: creating kprobe for tcp_send_loss_probe(). " .
-	         "Older kernel version?";
-}
-if ($stacks) {
-	writeto "1", "options/stacktrace" or print STDERR "WARNING: " .
-	    "unable to enable stacktraces.\n";
-}
-enable_kprobe $kname_rtr or edie "ERROR: enabling $kname_rtr probe.";
-if ($tlp) {
-	enable_kprobe $kname_tlp or edie "ERROR: enabling $kname_tlp probe.";
-}
-map_tcp_states();
-printf "%-8s %-6s %-20s -- %-20s %-12s\n", "TIME", "PID", "LADDR:LPORT",
-    "RADDR:RPORT", "STATE";
+def inet_h2a(address):
+    return ".".join(str(int(address[index:index + 2], 16))
+                    for index in (6, 4, 2, 0))
 
-#
-# Read and print event data. This loop waits one second then reads the buffered
-# trace data, then caches /proc/net/tcp, then iterates over the buffered trace
-# data using the cached state. While this minimizes CPU overheads, it only
-# works because sockets that are retransmitting are usually long lived, and
-# remain in /proc/net/tcp for at least our sleep interval.
-#
-while (1) {
-	sleep $interval;
 
-	# buffer trace data
-	open TPIPE, "trace" or edie "ERROR: opening trace_pipe.";
-	my @trace = ();
-	while (<TPIPE>) {
-		next if /^#/;
-		push @trace, $_;
-	}
-	close TPIPE;
-	writeto "0", "trace" or edie "ERROR: clearing trace";
+def cache_tcp():
+    sockets = {}
+    try:
+        with open("/proc/net/tcp") as tcp_file:
+            for line in tcp_file:
+                if re.match(r"^ *sl", line):
+                    continue
+                fields = line.split()
+                if len(fields) < 12:
+                    continue
+                socket_pointer = fields[11]
+                if socket_pointer.startswith("0x"):
+                    socket_pointer = socket_pointer[2:]
+                sockets[socket_pointer] = {
+                    "laddr": fields[1], "raddr": fields[2], "state": fields[3]
+                }
+    except OSError:
+        die("ERROR: reading /proc/net/tcp.", remove_lock=True)
+    return sockets
 
-	# cache /proc/net/tcp state
-	if (scalar @trace) {
-		cache_tcp();
-	}
 
-	# process and print events
-	for (@trace) {
-		if ($stacks && /^ *=>/) {
-			print $_;
-			next;
-		}
+def cleanup(*_args, quiet=False):
+    global cleaning_up
+    if cleaning_up:
+        raise SystemExit(0)
+    cleaning_up = True
+    if not quiet:
+        print("\nEnding tracing...")
+    if stacks and not writeto("0", "options/stacktrace"):
+        if not quiet:
+            print("WARNING: unable to disable stacktraces.", file=sys.stderr)
+    if not remove_kprobe(KNAME_RTR):
+        if not quiet:
+            print(f"ERROR: removing kprobe {KNAME_RTR}", file=sys.stderr)
+    if tlp and not remove_kprobe(KNAME_TLP):
+        if not quiet:
+            print(f"ERROR: removing kprobe {KNAME_TLP}", file=sys.stderr)
+    writeto("", "trace")
+    try:
+        os.unlink(FLOCK)
+    except OSError:
+        pass
+    raise SystemExit(0)
 
-		my ($taskpid, $rest) = split ' ', $_, 2;
-		my ($task, $pid) = $taskpid =~ /(.*)-(\d+)/;
 
-		my ($skp) = $rest =~ /sk=([0-9a-fx]*)/;
-		next unless defined $skp and $skp ne "";
-		$skp =~ s/^0x//;
+def end_with_error(message):
+    print(message, file=sys.stderr)
+    # Perl's edie() closed stdout and stderr before cleanup, making cleanup
+    # silent while still removing probes and returning its historical status.
+    cleanup(quiet=True)
 
-		my ($laddr, $lport, $raddr, $rport, $state);
-		if (defined $tcp{$skp}) {
-			# convert /proc/net/tcp hex to dotted quads
-			my ($hladdr, $hlport) = split /:/, $tcp{$skp}{laddr};
-			my ($hraddr, $hrport) = split /:/, $tcp{$skp}{raddr};
-			$laddr = inet_h2a($hladdr);
-			$raddr = inet_h2a($hraddr);
-			$lport = hex($hlport);
-			$rport = hex($hrport);
-			$state = $tcpstate[hex($tcp{$skp}{state})];
-		} else {
-			# socket closed too quickly
-			($laddr, $raddr) = ("-", "-");
-			($lport, $rport) = ("-", "-");
-			$state = "-";
-		}
 
-		my $now = strftime "%H:%M:%S", localtime;
-		printf "%-8s %-6s %-20s %s> %-20s %-12s\n", $now, $pid,
-		    "$laddr:$lport", $rest =~ /$kname_tlp/ ? "L" : "R",
-		    "$raddr:$rport", $state,
-	}
-}
+def main(argv):
+    global stacks, tlp
+    try:
+        options, _arguments = getopt.getopt(argv, "hsl", ["help", "stacks", "tlp"])
+    except getopt.GetoptError:
+        usage()
+    for option, _value in options:
+        if option in ("-h", "--help"):
+            usage()
+        if option in ("-s", "--stacks"):
+            stacks = True
+        if option in ("-l", "--tlp"):
+            tlp = True
 
-### end tracing
-cleanup();
+    for signum in (signal.SIGINT, signal.SIGQUIT, signal.SIGTERM,
+                   signal.SIGPIPE, signal.SIGHUP):
+        signal.signal(signum, cleanup)
+    try:
+        os.chdir(TRACING)
+    except OSError:
+        die("ERROR: accessing tracing. Root? Kernel has FTRACE?\n"
+            "debugfs mounted? (mount -t debugfs debugfs /sys/kernel/debug)")
 
-sub cleanup {
-	print "\nEnding tracing...\n";
-	close TPIPE;
-	if ($stacks) {
-		writeto "0", "options/stacktrace" or print STDERR "WARNING: " .
-		    "unable to disable stacktraces.\n";
-	}
-	remove_kprobe $kname_rtr
-	    or print STDERR "ERROR: removing kprobe $kname_rtr\n";
-	if ($tlp) {
-		remove_kprobe $kname_tlp
-		    or print STDERR "ERROR: removing kprobe $kname_tlp\n";
-	}
-	writeto "", "trace";
-	unlink $flock;
-	exit;
-}
+    if os.path.exists(FLOCK):
+        try:
+            with open(FLOCK) as lock_file:
+                fpid = lock_file.readline().rstrip("\n")
+        except OSError:
+            fpid = ""
+        die(f"ERROR: ftrace may be in use by PID {fpid} ({FLOCK})")
+    if not writeto(str(os.getpid()), FLOCK):
+        die(f"ERROR: unable to write {FLOCK}.")
+    if not writeto("nop", "current_tracer"):
+        die("ERROR: disabling current_tracer.", remove_lock=True)
+    if not create_kprobe(KNAME_RTR, "tcp_retransmit_skb sk=%di"):
+        die("ERROR: creating kprobe for tcp_retransmit_skb().", remove_lock=True)
+    if tlp and not create_kprobe(KNAME_TLP, "tcp_send_loss_probe sk=%di"):
+        end_with_error("ERROR: creating kprobe for tcp_send_loss_probe(). Older kernel version?")
+    if stacks and not writeto("1", "options/stacktrace"):
+        print("WARNING: unable to enable stacktraces.", file=sys.stderr)
+    if not enable_kprobe(KNAME_RTR):
+        end_with_error(f"ERROR: enabling {KNAME_RTR} probe.")
+    if tlp and not enable_kprobe(KNAME_TLP):
+        end_with_error(f"ERROR: enabling {KNAME_TLP} probe.")
 
-# from /usr/include/netinet/tcp.h:
-__DATA__
-  TCP_ESTABLISHED = 1,
-  TCP_SYN_SENT,
-  TCP_SYN_RECV,
-  TCP_FIN_WAIT1,
-  TCP_FIN_WAIT2,
-  TCP_TIME_WAIT,
-  TCP_CLOSE,
-  TCP_CLOSE_WAIT,
-  TCP_LAST_ACK,
-  TCP_LISTEN,
-  TCP_CLOSING   /* now a valid state */
+    print(f"{'TIME':<8} {'PID':<6} {'LADDR:LPORT':<20} -- "
+          f"{'RADDR:RPORT':<20} {'STATE':<12}", flush=True)
+    while True:
+        time.sleep(INTERVAL)
+        try:
+            with open("trace", errors="replace") as trace_file:
+                trace = [line for line in trace_file if not line.startswith("#")]
+        except OSError:
+            end_with_error("ERROR: opening trace_pipe.")
+        if not writeto("0", "trace"):
+            end_with_error("ERROR: clearing trace")
+        sockets = cache_tcp() if trace else {}
+
+        for line in trace:
+            if stacks and re.match(r"^ *=>", line):
+                print(line, end="", flush=True)
+                continue
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            task_match = re.match(r"(.*)-(\d+)$", parts[0])
+            socket_match = re.search(r"sk=([0-9a-fx]*)", parts[1])
+            if not task_match or not socket_match or not socket_match.group(1):
+                continue
+            pid = task_match.group(2)
+            socket_pointer = socket_match.group(1)
+            if socket_pointer.startswith("0x"):
+                socket_pointer = socket_pointer[2:]
+            socket = sockets.get(socket_pointer)
+            if socket:
+                local_address, local_port = socket["laddr"].split(":")
+                remote_address, remote_port = socket["raddr"].split(":")
+                laddr, raddr = inet_h2a(local_address), inet_h2a(remote_address)
+                lport, rport = int(local_port, 16), int(remote_port, 16)
+                state_number = int(socket["state"], 16)
+                state = TCP_STATES[state_number] if state_number < len(TCP_STATES) else ""
+            else:
+                laddr = raddr = lport = rport = state = "-"
+            packet_type = "L" if KNAME_TLP in parts[1] else "R"
+            print(f"{time.strftime('%H:%M:%S'):<8} {pid:<6} "
+                  f"{f'{laddr}:{lport}':<20} {packet_type}> "
+                  f"{f'{raddr}:{rport}':<20} {state:<12}", flush=True)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

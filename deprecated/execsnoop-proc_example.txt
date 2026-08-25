@@ -1,4 +1,4 @@
-Demonstrations of execsnoop-proc, the Linux ftrace version.
+Demonstrations of execsnoop-proc, the Linux ftrace and Python 3 version.
 
 Here's execsnoop showing what's really executed by "man ls":
 

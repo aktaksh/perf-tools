@@ -86,8 +86,9 @@ Look for "L>" in the type column ("--") for TLP events.
 Use -h to print the USAGE message:
 
 # ./tcpretrans -h
-USAGE: tcpretrans [-hs]
+USAGE: tcpretrans [-hls]
                   -h       # help message
+                  -l       # trace TCP tail loss probes
                   -s       # print stack traces
    eg,
        tcpretrans          # trace TCP retransmits
